@@ -44,9 +44,9 @@ Descripción del hardware:
     - Micro ESP32
     - Driver pantalla ST7789V, pantalla IPS 1.14" (Pinout MOSI - 19, SCLK - 18, CS - 5, DC - 16, RST - 23, BL - 4)
     - Programación con ESP-IDF
-    - GPIO2 -> Touch 2 -> Avanzar
+    - GPIO13 -> Touch 4 -> Avanzar
     - GPIO15 -> Touch 3 -> Marcha
-    - GPIO13 -> Touch 4 -> Retroceder
+    - GPIO2 -> Touch 2 -> Retroceder
     - GPIO25 -> Pulso a driver motor
     - GPIO26 -> Dirección a driver motor. A nivel 1 avanzar.
     - GPIO27 -> EN Habilitación driver motor.
