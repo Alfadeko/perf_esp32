@@ -115,3 +115,7 @@ Definidas en `main/CMakeLists.txt`:
 
 - El proyecto usa API tactil nueva (`driver/touch_sens.h`) para evitar deprecaciones de API legacy.
 - Puede haber avisos de include en IntelliSense aunque la compilacion real de ESP-IDF sea correcta; valida siempre con build.
+
+## Cambios 2026/07/04
+    Modificado la pulsación de marcha, es difícil acertar entre 1 y 2 sg. Ahora es una pulsación entre 100 ms. y 2sg. Además alterno los pines de avanzar y retroceder, ya que en la placa física queda mejor.
+    
