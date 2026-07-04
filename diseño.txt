@@ -1,0 +1,53 @@
+Firmware para placa ESP32 TTGO t Display
+
+Descripción del proyecto:
+
+    - Controla un dispositivo tipo "perfusor", que avanza una jeringa de alimentación a una velocidad una distancia concreta y 
+tras esto retrocede el carro hasta el punto de origen.
+    - El dispositivo que acciona el carro es un motor paso a paso Nema 11, mediante un driver tipo pulso - dirección.
+    - El motor estará activado (EN) solo durante el movimiento para evitar calentamiento innecesario.
+    - El driver está configurado para 1/4, el motor es de 200 pulsos/vuelta.
+    - El husillo accionado tiene 1 mm. de paso. La velocidad a desplazar es configurable tanto para el avance como para el
+retroceso, entre 0'1 hasta 20 mm/sg.
+    - El recorrido total también es configurable.
+    - La velocidad se configura en mm/sg., la posición en mm. La rampa de aceleración es fija, solo modificable en firmware, y será 5 mm/sg2
+    - La configuración se guarda en memoria no volátil del micro.
+    - Tres pulsadores táctiles sirven para operarlo, así como para configurarlo. Se aprovecha la propiedad de táctil del micro ESP32.
+    - Los pulsadores serán "Adelante", "Marcha", "Atrás"
+    - En el encendido se hará la calibración de los valores capacitivos del touch.
+    - Durante la marcha, en la pantalla se mostrará en número de ciclos que se han realizado (Ida + vuelta), y estos se reiniciarán 
+al encender el dispositivo.
+    - Una pulsación de marcha durante el ciclo automático, pausa este. Una pulsación larga (+2sg) lo cancela
+    -
+    
+Descripción de la operativa (Funcionamiento)
+
+    - Al encender la pantalla se muestra una presentación con el texto "eugeidea 2026" y una breve animación.
+    - Tras 4 segundos en texto grande se muestra el número de ciclos realizado (0 al reiniciar.)
+    - Los pulsadores avazar y retroceder realizan esa tarea, a las velocidades configuradas. En este caso es en manual, por lo que
+no se incrementa ni decrementa la posición.
+    - Una pulsación de entre 1 y 2 sg. inicia la marcha. Esta consiste en un avance de la distancia programada a la velocidad programada,
+y un retroceso a la posición original a la velocidad programada para el retroceso. Se incrementa el contador en una unidad.
+Además un texto en la esquina superior derecha indicara la posición actual en %
+    - Para la configuración, se pulsa marcha más de 4sg, entrando así en el modo de configuración tipo rueda. Con avance o retroceso
+nos desplazamos entre las opciones de configuración:
+            -> Velocidad de avance -> Distancia de avance -> Velocidad de retroceso -> Distancia de retroceso -> Pausa tras avance 
+            -> Acerca de -> Guardar y Salir -> Cancelar
+    - Al pulsar salir, los parámetros se guardan en rom
+    - Para editar los parámetros, entramos mediante marcha en la correspondiente pantalla de configuración, y nos depsplazamos dígito
+a dígito. La velocidad desde 0'10 hasta 20'00 mm/sg, la distancia hasta 999,9 mm.    
+
+
+Descripción del hardware:
+
+    - Placa con pantalla y hardware ESP32 TTGO t Display
+    - Micro ESP32
+    - Driver pantalla ST7789V, pantalla IPS 1.14" (Pinout MOSI - 19, SCLK - 18, CS - 5, DC - 16, RST - 23, BL - 4)
+    - Programación con ESP-IDF
+    - GPIO2 -> Touch 2 -> Avanzar
+    - GPIO15 -> Touch 3 -> Marcha
+    - GPIO13 -> Touch 4 -> Retroceder
+    - GPIO25 -> Pulso a driver motor
+    - GPIO26 -> Dirección a driver motor. A nivel 1 avanzar.
+    - GPIO27 -> EN Habilitación driver motor.
+
