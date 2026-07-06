@@ -8,7 +8,8 @@
   "idf.port": "/dev/ttyACM0",
   "idf.currentSetup": "/home/eugenio/.espressif/v6.0.1/esp-idf",
   "idf.customExtraVars": {
-    "IDF_TARGET": "esp32"
+    "IDF_TARGET": "esp32",
+    "PATH": "/home/eugenio/.espressif/tools/ninja/1.12.1:${env:PATH}"
   },
   "clangd.path": "/home/eugenio/.espressif/tools/esp-clang/esp-20.1.1_20250829/esp-clang/bin/clangd",
   "clangd.arguments": [
