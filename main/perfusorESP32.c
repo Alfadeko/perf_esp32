@@ -41,15 +41,16 @@
 #define PIN_DIR 26
 #define PIN_EN 27
 
-#define TOUCH_ADV_CHAN TOUCH_PAD_GPIO13_CHANNEL
+#define TOUCH_ADV_CHAN TOUCH_PAD_GPIO2_CHANNEL
 #define TOUCH_RUN_CHAN TOUCH_PAD_GPIO15_CHANNEL
-#define TOUCH_BACK_CHAN TOUCH_PAD_GPIO2_CHANNEL
+#define TOUCH_BACK_CHAN TOUCH_PAD_GPIO13_CHANNEL
 
 #define STEPS_PER_MM 800.0f
 #define MIN_SPEED_MM_S 0.10f
 #define MAX_SPEED_MM_S 20.00f
 #define MAX_DISTANCE_MM 999.9f
 #define ACCEL_MM_S2 5.0f
+#define END_REACHED_MARGIN_MM 5.0f
 
 #define MAGIC_CFG 0x50465253u
 
@@ -57,8 +58,6 @@ typedef struct {
     float speed_fwd;
     float dist_fwd;
     float speed_back;
-    float dist_back;
-    float pause_s;
     uint32_t magic;
 } perf_cfg_t;
 
@@ -71,6 +70,7 @@ typedef struct {
     bool just_pressed;
     bool just_released;
     int64_t press_start_ms;
+    uint32_t prev_hold_ms;
     uint32_t last_hold_ms;
 } touch_btn_t;
 
@@ -86,8 +86,6 @@ typedef enum {
     MENU_SPEED_FWD = 0,
     MENU_DIST_FWD,
     MENU_SPEED_BACK,
-    MENU_DIST_BACK,
-    MENU_PAUSE,
     MENU_ABOUT,
     MENU_SAVE_EXIT,
     MENU_CANCEL,
@@ -104,16 +102,20 @@ static menu_item_t s_menu_idx;
 static int s_edit_digit_idx;
 static char s_edit_buf[8];
 static bool s_motor_ready;
+static bool s_motor_busy;
 static float s_position_pct;
+static float s_position_mm;
 static touch_sensor_handle_t s_touch_handle;
 static gptimer_handle_t s_step_timer;
 static volatile bool s_step_active;
 static volatile bool s_step_high;
 static volatile uint32_t s_step_target_pulses;
 static volatile uint32_t s_step_done_pulses;
+static volatile bool s_motor_stop_requested;
 static QueueHandle_t s_motor_cmd_queue;
 static TaskHandle_t s_motor_waiter_task;
 static volatile bool s_motor_last_cancelled;
+static volatile uint32_t s_motor_last_steps_done;
 
 typedef struct {
     float distance_mm;
@@ -125,7 +127,6 @@ typedef struct {
 static touch_btn_t s_btn_adv = {.chan_id = TOUCH_ADV_CHAN};
 static touch_btn_t s_btn_run = {.chan_id = TOUCH_RUN_CHAN};
 static touch_btn_t s_btn_back = {.chan_id = TOUCH_BACK_CHAN};
-
 static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 {
     return (uint16_t)(((r & 0xF8u) << 8) | ((g & 0xFCu) << 3) | (b >> 3));
@@ -240,8 +241,9 @@ static void draw_boot_screen(void)
 }
 
 static void draw_progress_percent(float pct);
+static void refresh_main_screen(void);
 
-static void draw_main_screen(uint32_t cycles)
+static void draw_main_screen(void)
 {
     const uint16_t bg = rgb565(12, 16, 20);
     const uint16_t fg = rgb565(245, 245, 245);
@@ -253,7 +255,7 @@ static void draw_main_screen(uint32_t cycles)
     lcd_clear(bg);
     draw_progress_percent(s_position_pct);
 
-    snprintf(line, sizeof(line), "%lu", (unsigned long)cycles);
+    snprintf(line, sizeof(line), "%lu", (unsigned long)s_cycles);
     text_w = (int)strlen(line) * 6 * scale;
     x = LCD_WIDTH - text_w - 8;
     if (x < 96) {
@@ -284,19 +286,17 @@ static void draw_main_touch_feedback(bool adv_pressed, bool run_pressed, bool ba
 {
     const uint16_t bg = rgb565(12, 16, 20);
     lcd_fill_rect(0, 108, LCD_WIDTH, 27, bg);
-    lcd_draw_text_upper(8, 114, "ADEL", adv_pressed ? rgb565(255, 215, 90) : rgb565(140, 160, 180), bg, 1);
-    lcd_draw_text_upper(88, 114, "MARCHA", run_pressed ? rgb565(255, 110, 95) : rgb565(140, 160, 180), bg, 1);
-    lcd_draw_text_upper(188, 114, "ATRAS", back_pressed ? rgb565(95, 200, 255) : rgb565(140, 160, 180), bg, 1);
+    lcd_draw_text_upper(8, 114, "RETROCESO", back_pressed ? rgb565(255, 215, 90) : rgb565(140, 160, 180), bg, 1);
+    lcd_draw_text_upper(92, 114, "PARO", run_pressed ? rgb565(255, 110, 95) : rgb565(140, 160, 180), bg, 1);
+    lcd_draw_text_upper(188, 114, "AVANCE", adv_pressed ? rgb565(95, 200, 255) : rgb565(140, 160, 180), bg, 1);
 }
 
 static const char *menu_name(menu_item_t item)
 {
     static const char *names[MENU_COUNT] = {
         "Velocidad avance",
-        "Distancia avance",
+        "Recorrido total",
         "Velocidad retroceso",
-        "Distancia retroceso",
-        "Pausa tras avance",
         "Acerca de",
         "Guardar y salir",
         "Cancelar",
@@ -325,12 +325,6 @@ static void draw_config_screen(void)
     case MENU_SPEED_BACK:
         snprintf(v, sizeof(v), "%.2f mm/s", s_cfg_edit.speed_back);
         break;
-    case MENU_DIST_BACK:
-        snprintf(v, sizeof(v), "%.1f mm", s_cfg_edit.dist_back);
-        break;
-    case MENU_PAUSE:
-        snprintf(v, sizeof(v), "%.1f s", s_cfg_edit.pause_s);
-        break;
     case MENU_ABOUT:
         snprintf(v, sizeof(v), "Version 2026");
         break;
@@ -343,7 +337,7 @@ static void draw_config_screen(void)
     }
 
     lcd_draw_text_upper(8, 82, v, rgb565(255, 240, 120), bg, 2);
-    lcd_draw_text_upper(8, 120, "A/B rueda, marcha entra", rgb565(130, 170, 190), bg, 1);
+    lcd_draw_text_upper(8, 120, "A/B rueda, paro entra", rgb565(130, 170, 190), bg, 1);
 }
 
 static void draw_about_screen(void)
@@ -352,7 +346,7 @@ static void draw_about_screen(void)
     lcd_clear(bg);
     lcd_draw_text_upper(18, 18, "PERFUSOR ESP32", rgb565(200, 235, 255), bg, 2);
     lcd_draw_text_upper(18, 55, "eugeidea 2026", rgb565(120, 230, 255), bg, 2);
-    lcd_draw_text_upper(18, 95, "MARCHA para volver", rgb565(160, 170, 220), bg, 1);
+    lcd_draw_text_upper(18, 95, "PARO para volver", rgb565(160, 170, 220), bg, 1);
 }
 
 static void draw_edit_screen(void)
@@ -365,7 +359,7 @@ static void draw_edit_screen(void)
     int pos = s_edit_digit_idx;
     int x = 36 + (6 * 4 * pos);
     lcd_fill_rect(x, 90, 18, 4, rgb565(255, 180, 80));
-    lcd_draw_text_upper(8, 112, "A/B digito, marcha siguiente", rgb565(200, 180, 130), bg, 1);
+    lcd_draw_text_upper(8, 112, "A/B digito, paro siguiente", rgb565(200, 180, 130), bg, 1);
 }
 
 static float clampf(float v, float lo, float hi)
@@ -381,11 +375,9 @@ static float clampf(float v, float lo, float hi)
 
 static void cfg_set_defaults(perf_cfg_t *cfg)
 {
-    cfg->speed_fwd = 2.00f;
-    cfg->dist_fwd = 20.0f;
-    cfg->speed_back = 2.00f;
-    cfg->dist_back = 20.0f;
-    cfg->pause_s = 0.5f;
+    cfg->speed_fwd = 0.60f;
+    cfg->dist_fwd = 112.0f;
+    cfg->speed_back = 10.0f;
     cfg->magic = MAGIC_CFG;
 }
 
@@ -417,9 +409,79 @@ static void cfg_load(perf_cfg_t *cfg)
     cfg->speed_fwd = clampf(cfg->speed_fwd, MIN_SPEED_MM_S, MAX_SPEED_MM_S);
     cfg->speed_back = clampf(cfg->speed_back, MIN_SPEED_MM_S, MAX_SPEED_MM_S);
     cfg->dist_fwd = clampf(cfg->dist_fwd, 0.0f, MAX_DISTANCE_MM);
-    cfg->dist_back = clampf(cfg->dist_back, 0.0f, MAX_DISTANCE_MM);
-    cfg->pause_s = clampf(cfg->pause_s, 0.0f, 60.0f);
     cfg->magic = MAGIC_CFG;
+}
+
+static int64_t now_ms(void)
+{
+    return esp_timer_get_time() / 1000;
+}
+
+static void refresh_position_pct(void)
+{
+    if (s_cfg.dist_fwd <= 0.0f) {
+        s_position_pct = 0.0f;
+        return;
+    }
+    s_position_pct = clampf((s_position_mm * 100.0f) / s_cfg.dist_fwd, 0.0f, 100.0f);
+}
+
+static void refresh_main_screen(void)
+{
+    refresh_position_pct();
+    draw_main_screen();
+}
+
+static void apply_steps_to_position(uint32_t steps_done, bool forward)
+{
+    float delta_mm = (float)steps_done / STEPS_PER_MM;
+    if (forward) {
+        s_position_mm += delta_mm;
+    } else {
+        s_position_mm -= delta_mm;
+    }
+    s_position_mm = clampf(s_position_mm, 0.0f, s_cfg.dist_fwd);
+    refresh_position_pct();
+}
+
+static bool touch_button_pressed_raw(const touch_btn_t *btn)
+{
+    uint32_t val32 = 0;
+    esp_err_t err = touch_channel_read_data(btn->chan_handle, TOUCH_CHAN_DATA_TYPE_SMOOTH, &val32);
+    if (err != ESP_OK) {
+        err = touch_channel_read_data(btn->chan_handle, TOUCH_CHAN_DATA_TYPE_RAW, &val32);
+    }
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    uint16_t val = (uint16_t)((val32 > 0xFFFFu) ? 0xFFFFu : val32);
+    return val < btn->threshold;
+}
+
+static bool run_button_pressed_raw(void)
+{
+    return touch_button_pressed_raw(&s_btn_run);
+}
+
+static bool back_button_pressed_raw(void)
+{
+    return touch_button_pressed_raw(&s_btn_back);
+}
+
+static bool motor_stop_requested(void)
+{
+    static int64_t last_poll_ms = 0;
+    int64_t current_ms = now_ms();
+
+    if (s_motor_stop_requested) {
+        return true;
+    }
+    if ((current_ms - last_poll_ms) < 20) {
+        return false;
+    }
+    last_poll_ms = current_ms;
+    return run_button_pressed_raw();
 }
 
 static esp_err_t lcd_init(void)
@@ -519,7 +581,7 @@ static esp_err_t touch_init_and_calibrate(void)
             ESP_LOGW(TAG, "touch chan %d without valid samples, using safe defaults", btns[i]->chan_id);
         } else {
             btns[i]->baseline = (uint16_t)(acc / (uint32_t)valid_samples);
-            btns[i]->threshold = (uint16_t)(btns[i]->baseline * 9 / 10);
+            btns[i]->threshold = (uint16_t)(btns[i]->baseline * 84 / 100);
         }
         if (btns[i]->threshold == 0) {
             btns[i]->threshold = 1;
@@ -536,6 +598,7 @@ static esp_err_t touch_init_and_calibrate(void)
 
 static void touch_update_btn(touch_btn_t *b)
 {
+    uint32_t prev_hold_ms = b->last_hold_ms;
     uint32_t val32 = 0;
     esp_err_t err = touch_channel_read_data(b->chan_handle, TOUCH_CHAN_DATA_TYPE_SMOOTH, &val32);
     if (err != ESP_OK) {
@@ -560,6 +623,12 @@ static void touch_update_btn(touch_btn_t *b)
     if (b->pressed) {
         b->last_hold_ms = (uint32_t)(now_ms - b->press_start_ms);
     }
+    b->prev_hold_ms = prev_hold_ms;
+}
+
+static bool touch_hold_crossed(const touch_btn_t *b, uint32_t hold_ms)
+{
+    return b->pressed && b->prev_hold_ms < hold_ms && b->last_hold_ms >= hold_ms;
 }
 
 static void touch_poll_all(void)
@@ -624,57 +693,10 @@ static bool motor_timer_set_period(uint32_t period_us)
     return gptimer_set_alarm_action(s_step_timer, &alarm_cfg) == ESP_OK;
 }
 
-static bool auto_cycle_cancel_requested(void)
-{
-    static int64_t last_poll_ms = 0;
-    static int64_t hold_start_ms = 0;
-    static bool was_pressed = false;
-
-    int64_t now_ms = esp_timer_get_time() / 1000;
-    if ((now_ms - last_poll_ms) < 20) {
-        return false;
-    }
-    last_poll_ms = now_ms;
-
-    uint32_t val32 = 0;
-    esp_err_t err = touch_channel_read_data(s_btn_run.chan_handle, TOUCH_CHAN_DATA_TYPE_SMOOTH, &val32);
-    if (err != ESP_OK) {
-        err = touch_channel_read_data(s_btn_run.chan_handle, TOUCH_CHAN_DATA_TYPE_RAW, &val32);
-    }
-    if (err != ESP_OK) {
-        return false;
-    }
-
-    uint16_t val = (uint16_t)((val32 > 0xFFFFu) ? 0xFFFFu : val32);
-    bool pressed = val < s_btn_run.threshold;
-    if (pressed) {
-        if (!was_pressed) {
-            hold_start_ms = now_ms;
-        }
-        was_pressed = true;
-        return (now_ms - hold_start_ms) >= 1000;
-    }
-
-    was_pressed = false;
-    hold_start_ms = 0;
-    return false;
-}
-
-static bool wait_with_cancel(uint32_t delay_ms)
-{
-    int64_t start_ms = esp_timer_get_time() / 1000;
-    while ((uint32_t)((esp_timer_get_time() / 1000) - start_ms) < delay_ms) {
-        if (auto_cycle_cancel_requested()) {
-            return true;
-        }
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-    return false;
-}
-
 static bool motor_execute_move(float distance_mm, float target_speed_mm_s, bool forward, bool with_progress)
 {
     uint32_t steps = (uint32_t)(distance_mm * STEPS_PER_MM + 0.5f);
+    s_motor_last_steps_done = 0;
     if (steps == 0) {
         return false;
     }
@@ -701,10 +723,11 @@ static bool motor_execute_move(float distance_mm, float target_speed_mm_s, bool 
     s_step_done_pulses = 0;
     s_step_high = false;
     s_step_active = true;
+    s_motor_stop_requested = false;
     GPIO.out_w1tc = (1UL << PIN_STEP);
 
     while (done_steps < steps && s_step_active) {
-        if (auto_cycle_cancel_requested()) {
+        if (motor_stop_requested()) {
             cancelled = true;
             s_step_active = false;
             break;
@@ -760,74 +783,19 @@ static bool motor_execute_move(float distance_mm, float target_speed_mm_s, bool 
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
+    done_steps = s_step_done_pulses;
+    s_motor_last_steps_done = done_steps;
+
     s_step_active = false;
     gptimer_stop(s_step_timer);
     GPIO.out_w1tc = (1UL << PIN_STEP);
     motor_set_enable(false);
+    s_motor_stop_requested = false;
 
     if (with_progress && !cancelled) {
         draw_progress_percent(forward ? 100.0f : 0.0f);
     }
     return cancelled;
-}
-
-static void motor_jog_while_pressed(bool forward, float target_speed_mm_s)
-{
-    if (!s_motor_ready || s_step_timer == NULL) {
-        return;
-    }
-
-    float target = clampf(target_speed_mm_s, MIN_SPEED_MM_S, MAX_SPEED_MM_S);
-    uint32_t last_period_us = 0;
-    int64_t start_us = esp_timer_get_time();
-
-    gpio_set_level(PIN_DIR, forward ? 1 : 0);
-    motor_set_enable(true);
-
-    s_step_target_pulses = UINT32_MAX;
-    s_step_done_pulses = 0;
-    s_step_high = false;
-    s_step_active = true;
-    GPIO.out_w1tc = (1UL << PIN_STEP);
-
-    while (s_step_active) {
-        touch_poll_all();
-        bool keep = forward ? s_btn_adv.pressed : s_btn_back.pressed;
-        if (!keep || s_mode != UI_MAIN) {
-            break;
-        }
-
-        float t = (float)(esp_timer_get_time() - start_us) / 1000000.0f;
-        float cur = fminf(target, fmaxf(MIN_SPEED_MM_S, ACCEL_MM_S2 * t));
-        float freq = cur * STEPS_PER_MM;
-        if (freq < 1.0f) {
-            freq = 1.0f;
-        }
-
-        uint32_t period_us = (uint32_t)(1000000.0f / freq);
-        if (period_us < 8) {
-            period_us = 8;
-        }
-
-        if (period_us != last_period_us) {
-            if (!motor_timer_set_period(period_us)) {
-                break;
-            }
-            if (last_period_us == 0) {
-                if (gptimer_set_raw_count(s_step_timer, 0) != ESP_OK || gptimer_start(s_step_timer) != ESP_OK) {
-                    break;
-                }
-            }
-            last_period_us = period_us;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-
-    s_step_active = false;
-    gptimer_stop(s_step_timer);
-    GPIO.out_w1tc = (1UL << PIN_STEP);
-    motor_set_enable(false);
 }
 
 static void motor_worker_task(void *arg)
@@ -866,6 +834,85 @@ static bool motor_move_mm(float distance_mm, float target_speed_mm_s, bool forwa
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     s_motor_waiter_task = NULL;
     return s_motor_last_cancelled;
+}
+
+static bool perform_positioned_move(float distance_mm, float speed_mm_s, bool forward)
+{
+    if (distance_mm <= 0.0f) {
+        return false;
+    }
+
+    float end_threshold_mm = fmaxf(0.0f, s_cfg.dist_fwd - END_REACHED_MARGIN_MM);
+    bool was_near_end = (s_position_mm >= end_threshold_mm);
+
+    s_motor_busy = true;
+    s_motor_stop_requested = false;
+    bool cancelled = motor_move_mm(distance_mm, speed_mm_s, forward, true);
+    apply_steps_to_position(s_motor_last_steps_done, forward);
+
+    if (forward && !cancelled) {
+        bool now_near_end = (s_position_mm >= end_threshold_mm);
+        if (!was_near_end && now_near_end) {
+            s_cycles++;
+        }
+    }
+
+    s_motor_busy = false;
+    refresh_main_screen();
+    return cancelled;
+}
+
+static bool perform_manual_backdrive_until_release(void)
+{
+    if (!s_motor_ready) {
+        return false;
+    }
+
+    float target = clampf(s_cfg.speed_back, MIN_SPEED_MM_S, MAX_SPEED_MM_S);
+    float freq = target * STEPS_PER_MM;
+    if (freq < 1.0f) {
+        freq = 1.0f;
+    }
+    uint32_t period_us = (uint32_t)(1000000.0f / freq);
+    if (period_us < 8) {
+        period_us = 8;
+    }
+
+    s_motor_busy = true;
+    s_motor_stop_requested = false;
+
+    gpio_set_level(PIN_DIR, 0);
+    motor_set_enable(true);
+    s_step_high = false;
+    s_step_active = true;
+    s_step_target_pulses = UINT32_MAX;
+    s_step_done_pulses = 0;
+    GPIO.out_w1tc = (1UL << PIN_STEP);
+
+    bool aborted = false;
+    if (!motor_timer_set_period(period_us) ||
+        gptimer_set_raw_count(s_step_timer, 0) != ESP_OK ||
+        gptimer_start(s_step_timer) != ESP_OK) {
+        aborted = true;
+    }
+
+    while (!aborted && back_button_pressed_raw()) {
+        if (run_button_pressed_raw()) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    s_step_active = false;
+    gptimer_stop(s_step_timer);
+    GPIO.out_w1tc = (1UL << PIN_STEP);
+    motor_set_enable(false);
+    s_motor_stop_requested = false;
+    s_motor_busy = false;
+
+    s_position_mm = 0.0f;
+    refresh_main_screen();
+    return !aborted;
 }
 
 static void motor_start_worker(void)
@@ -925,28 +972,6 @@ static void motor_init(void)
     motor_start_worker();
 }
 
-static void run_auto_cycle(void)
-{
-    bool cancelled = false;
-
-    draw_main_screen(s_cycles);
-    draw_progress_percent(0.0f);
-    cancelled = motor_move_mm(s_cfg.dist_fwd, s_cfg.speed_fwd, true, true);
-
-    if (!cancelled && s_cfg.pause_s > 0.0f) {
-        cancelled = wait_with_cancel((uint32_t)(s_cfg.pause_s * 1000.0f));
-    }
-
-    if (!cancelled) {
-        cancelled = motor_move_mm(s_cfg.dist_back, s_cfg.speed_back, false, true);
-    }
-
-    if (!cancelled) {
-        s_cycles++;
-    }
-    draw_main_screen(s_cycles);
-}
-
 static void set_edit_buffer_from_menu(void)
 {
     switch (s_menu_idx) {
@@ -958,12 +983,6 @@ static void set_edit_buffer_from_menu(void)
         break;
     case MENU_SPEED_BACK:
         snprintf(s_edit_buf, sizeof(s_edit_buf), "%05.2f", s_cfg_edit.speed_back);
-        break;
-    case MENU_DIST_BACK:
-        snprintf(s_edit_buf, sizeof(s_edit_buf), "%05.1f", s_cfg_edit.dist_back);
-        break;
-    case MENU_PAUSE:
-        snprintf(s_edit_buf, sizeof(s_edit_buf), "%04.1f", s_cfg_edit.pause_s);
         break;
     default:
         s_edit_buf[0] = '\0';
@@ -987,12 +1006,6 @@ static void apply_edit_buffer_to_cfg(void)
         break;
     case MENU_SPEED_BACK:
         s_cfg_edit.speed_back = clampf(v, MIN_SPEED_MM_S, MAX_SPEED_MM_S);
-        break;
-    case MENU_DIST_BACK:
-        s_cfg_edit.dist_back = clampf(v, 0.0f, MAX_DISTANCE_MM);
-        break;
-    case MENU_PAUSE:
-        s_cfg_edit.pause_s = clampf(v, 0.0f, 60.0f);
         break;
     default:
         break;
@@ -1033,12 +1046,13 @@ static void app_loop(void)
     draw_boot_screen();
     vTaskDelay(pdMS_TO_TICKS(4000));
     s_mode = UI_MAIN;
-    draw_main_screen(s_cycles);
+    refresh_main_screen();
     draw_main_touch_feedback(false, false, false);
 
     bool last_adv_pressed = false;
     bool last_run_pressed = false;
     bool last_back_pressed = false;
+    bool skip_back_release_action = false;
 
     while (1) {
         touch_poll_all();
@@ -1051,30 +1065,36 @@ static void app_loop(void)
                 last_back_pressed = s_btn_back.pressed;
             }
 
-            if (s_btn_adv.just_pressed && !s_btn_back.pressed) {
-                motor_jog_while_pressed(true, s_cfg.speed_fwd);
-                draw_main_touch_feedback(s_btn_adv.pressed, s_btn_run.pressed, s_btn_back.pressed);
-                last_adv_pressed = s_btn_adv.pressed;
-                last_run_pressed = s_btn_run.pressed;
-                last_back_pressed = s_btn_back.pressed;
-            } else if (s_btn_back.just_pressed && !s_btn_adv.pressed) {
-                motor_jog_while_pressed(false, s_cfg.speed_back);
-                draw_main_touch_feedback(s_btn_adv.pressed, s_btn_run.pressed, s_btn_back.pressed);
-                last_adv_pressed = s_btn_adv.pressed;
-                last_run_pressed = s_btn_run.pressed;
-                last_back_pressed = s_btn_back.pressed;
+            if (touch_hold_crossed(&s_btn_run, 4000) && !s_motor_busy) {
+                s_cfg_edit = s_cfg;
+                s_menu_idx = MENU_SPEED_FWD;
+                s_mode = UI_CONFIG;
+                draw_config_screen();
             }
 
-            if (s_btn_run.just_released) {
-                uint32_t d = s_btn_run.last_hold_ms;
-                if (d >= 100 && d < 2000) {
-                    run_auto_cycle();
+            if (s_btn_adv.just_released) {
+                if (s_btn_adv.last_hold_ms >= 30 && !s_btn_back.pressed) {
+                    perform_positioned_move(fmaxf(0.0f, s_cfg.dist_fwd - s_position_mm), s_cfg.speed_fwd, true);
                     draw_main_touch_feedback(s_btn_adv.pressed, s_btn_run.pressed, s_btn_back.pressed);
-                } else if (d >= 4000) {
-                    s_cfg_edit = s_cfg;
-                    s_menu_idx = MENU_SPEED_FWD;
-                    s_mode = UI_CONFIG;
-                    draw_config_screen();
+                }
+            }
+
+            if (touch_hold_crossed(&s_btn_back, 4000) && !s_btn_adv.pressed && !s_motor_busy) {
+                if (perform_manual_backdrive_until_release()) {
+                    skip_back_release_action = true;
+                }
+                touch_poll_all();
+                draw_main_touch_feedback(s_btn_adv.pressed, s_btn_run.pressed, s_btn_back.pressed);
+            }
+
+            if (s_btn_back.just_released) {
+                if (skip_back_release_action) {
+                    skip_back_release_action = false;
+                } else {
+                    if (s_btn_back.last_hold_ms >= 30 && !s_btn_adv.pressed) {
+                        perform_positioned_move(fmaxf(0.0f, s_position_mm), s_cfg.speed_back, false);
+                        draw_main_touch_feedback(s_btn_adv.pressed, s_btn_run.pressed, s_btn_back.pressed);
+                    }
                 }
             }
         } else if (s_mode == UI_CONFIG) {
@@ -1086,8 +1106,8 @@ static void app_loop(void)
                 s_menu_idx = (menu_item_t)((s_menu_idx + MENU_COUNT - 1) % MENU_COUNT);
                 draw_config_screen();
             }
-            if (s_btn_run.just_released && s_btn_run.last_hold_ms < 1000) {
-                if (s_menu_idx <= MENU_PAUSE) {
+            if (touch_hold_crossed(&s_btn_run, 100)) {
+                if (s_menu_idx <= MENU_SPEED_BACK) {
                     set_edit_buffer_from_menu();
                     s_mode = UI_EDIT;
                     draw_edit_screen();
@@ -1100,12 +1120,12 @@ static void app_loop(void)
                         s_cfg = s_cfg_edit;
                     }
                     s_mode = UI_MAIN;
-                    draw_main_screen(s_cycles);
+                    refresh_main_screen();
                     draw_main_touch_feedback(s_btn_adv.pressed, s_btn_run.pressed, s_btn_back.pressed);
                 } else {
                     cfg_load(&s_cfg);
                     s_mode = UI_MAIN;
-                    draw_main_screen(s_cycles);
+                    refresh_main_screen();
                     draw_main_touch_feedback(s_btn_adv.pressed, s_btn_run.pressed, s_btn_back.pressed);
                 }
             }
@@ -1118,7 +1138,7 @@ static void app_loop(void)
                 edit_change_digit(-1);
                 draw_edit_screen();
             }
-            if (s_btn_run.just_released) {
+            if (touch_hold_crossed(&s_btn_run, 100)) {
                 if (edit_next_digit()) {
                     s_mode = UI_CONFIG;
                     draw_config_screen();
@@ -1127,7 +1147,7 @@ static void app_loop(void)
                 }
             }
         } else if (s_mode == UI_ABOUT) {
-            if (s_btn_run.just_released) {
+            if (touch_hold_crossed(&s_btn_run, 100)) {
                 s_mode = UI_CONFIG;
                 draw_config_screen();
             }
@@ -1151,7 +1171,11 @@ void app_main(void)
     s_cycles = 0;
     s_mode = UI_BOOT;
     s_motor_ready = false;
+    s_motor_busy = false;
+    s_position_mm = 0.0f;
     s_position_pct = 0.0f;
+    s_motor_stop_requested = false;
+    s_motor_last_steps_done = 0;
 
     ESP_ERROR_CHECK(lcd_init());
     esp_log_level_set("legacy_touch_driver", ESP_LOG_ERROR);

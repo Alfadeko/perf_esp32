@@ -5,11 +5,10 @@ Firmware de control para perfusor con ESP32, pantalla ST7789, entradas tactiles 
 ## Estado actual
 
 - Compila correctamente con ESP-IDF 6.0.1.
-- Motor con generacion de pulsos continua por GPTimer (sin comportamiento por bloques).
-- Arquitectura dual-core para movimiento automatico: la secuencia de movimiento se ejecuta en worker task fijada a Core 1.
-- Modo manual continuo (jog): al mantener pulsado ADEL/ATRAS se mueve de forma continua mientras dure la pulsacion.
-- En modo marcha, el porcentaje se redibuja solo cuando cambia el numero mostrado.
-- Cancelacion por pulsacion larga de MARCHA durante ciclo automatico.
+- Motor con generacion de pulsos continua por GPTimer y rampa de aceleracion/deceleracion.
+- Control principal basado en posicion: el equipo arranca asumiendo posicion 0 y mantiene la posicion actual mientras siga encendido.
+- El boton central ya no lanza un ciclo automatico: ahora actua como PARO instantaneo durante cualquier movimiento y sigue sirviendo para entrar y usar configuracion.
+- La pantalla principal prioriza un contador grande de llegadas al final de recorrido (contando como llegada cuando se alcanza la zona de 5 mm previa al final).
 
 ## Hardware y pines
 
@@ -32,49 +31,53 @@ Estos GPIO son aptos para salida en ESP32 clasico.
 
 ### Tactil capacitivo (touch_sens API nueva)
 
-- ADEL: GPIO2 (TOUCH_ADV_CHAN)
-- MARCHA: GPIO15 (TOUCH_RUN_CHAN)
-- ATRAS: GPIO13 (TOUCH_BACK_CHAN)
+- ADEL: GPIO13 (TOUCH_ADV_CHAN)
+- PARO: GPIO15 (TOUCH_RUN_CHAN)
+- ATRAS: GPIO2 (TOUCH_BACK_CHAN)
 
 ## Interfaz de uso
 
 ### Pantalla principal
 
-- Muestra porcentaje de posicion y contador de ciclos.
+- Muestra porcentaje de posicion y, como elemento principal, el contador de llegadas al final de recorrido.
 - Feedback visual de estado de los 3 botones tactiles.
 
 ### Acciones en pantalla principal
 
-- ADEL mantenido: movimiento manual continuo hacia adelante.
-- ATRAS mantenido: movimiento manual continuo hacia atras.
-- MARCHA pulsacion de 1 a <2 s: ejecuta un ciclo automatico.
-- MARCHA pulsacion >=4 s: entra a configuracion.
+- ADEL pulsacion >100 ms: avanza hasta el final del recorrido configurado a la velocidad de avance.
+- ATRAS pulsacion >100 ms: retrocede hasta la posicion 0 a la velocidad de retroceso.
+- PARO durante movimiento: detiene el avance o retroceso de forma inmediata, conservando la posicion alcanzada.
+- PARO pulsacion >=4 s: entra a configuracion.
 
-### Durante ciclo automatico
-
-- Avance con rampa de aceleracion/deceleracion.
-- Pausa configurable.
-- Retroceso con rampa.
-- Pulsacion larga de MARCHA (~1 s) cancela la operacion actual.
-
-### Menu de configuracion
+### Configuracion disponible
 
 - Velocidad avance (mm/s)
-- Distancia avance (mm)
+- Recorrido total (mm)
 - Velocidad retroceso (mm/s)
-- Distancia retroceso (mm)
-- Pausa tras avance (s)
 - Acerca de
 - Guardar y salir (NVS)
 - Cancelar cambios
 
+## Reglas de posicion
+
+- Al encender, el firmware considera que la posicion actual es 0.
+- La posicion se actualiza segun los pasos realmente ejecutados, de modo que un PARO a mitad de recorrido conserva la referencia interna.
+- Si el recorrido total configurado vale 0 mm, ADEL no produce movimiento.
+
 ## Parametros y limites
 
 - STEPS_PER_MM: 800.0
+- Margen para considerar "final alcanzado": 5.0 mm antes del final configurado
 - Velocidad minima: 0.10 mm/s
 - Velocidad maxima: 20.00 mm/s
 - Distancia maxima: 999.9 mm
 - Aceleracion: 5.0 mm/s^2
+
+## Valores por defecto
+
+- Recorrido total: 112.0 mm
+- Velocidad avance: 0.60 mm/s
+- Velocidad retroceso: 10.00 mm/s
 
 ## Estructura del proyecto
 
@@ -115,7 +118,15 @@ Definidas en `main/CMakeLists.txt`:
 
 - El proyecto usa API tactil nueva (`driver/touch_sens.h`) para evitar deprecaciones de API legacy.
 - Puede haber avisos de include en IntelliSense aunque la compilacion real de ESP-IDF sea correcta; valida siempre con build.
+- La ejecucion del movimiento sigue usando worker task en Core 1, pero ya no existe una secuencia de ciclo automatico; ahora cada accion ordena un unico desplazamiento posicional.
 
-## Cambios 2026/07/04
-    Modificado la pulsación de marcha, es difícil acertar entre 1 y 2 sg. Ahora es una pulsación entre 100 ms. y 2sg. Además alterno los pines de avanzar y retroceder, ya que en la placa física queda mejor.
+## Cambios 2026/07/06
+
+- Eliminado el modo automatico.
+- ADEL pasa a ejecutar el recorrido restante hasta el final configurado.
+- ATRAS pasa a volver siempre al cero logico.
+- MARCHA pasa a ser PARO instantaneo.
+- La pantalla principal vuelve a priorizar el contador de llegadas al final de recorrido.
+- El conteo de llegadas usa un umbral de 5 mm antes del final configurado.
+- Valores por defecto actualizados: 112 mm, 0.60 mm/s (avance) y 10.00 mm/s (retroceso).
     
