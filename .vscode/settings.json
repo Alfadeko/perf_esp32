@@ -9,8 +9,12 @@
   "idf.currentSetup": "/home/eugenio/.espressif/v6.0.1/esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32",
-    "PATH": "/home/eugenio/.espressif/tools/ninja/1.12.1:${env:PATH}"
+    "IDF_PATH": "/home/eugenio/.espressif/v6.0.1/esp-idf",
+    "IDF_TOOLS_PATH": "/home/eugenio/.espressif",
+    "PYTHON_BIN_PATH": "/home/eugenio/.espressif/tools/python/v6.0.1/venv/bin/python",
+    "PATH": "/home/eugenio/.espressif/tools/ninja/1.12.1:/home/eugenio/.espressif/tools/cmake/3.30.2/bin:/home/eugenio/.espressif/tools/python/v6.0.1/venv/bin:${env:PATH}"
   },
+  "idf.enableSizeTaskAfterBuildTask": false,
   "clangd.path": "/home/eugenio/.espressif/tools/esp-clang/esp-20.1.1_20250829/esp-clang/bin/clangd",
   "clangd.arguments": [
     "--background-index",

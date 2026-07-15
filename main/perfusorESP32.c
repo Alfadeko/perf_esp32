@@ -56,10 +56,18 @@
 
 typedef struct {
     float speed_fwd;
+    float speed_fwd_fast;
     float dist_fwd;
     float speed_back;
     uint32_t magic;
 } perf_cfg_t;
+
+typedef struct {
+    float speed_fwd;
+    float dist_fwd;
+    float speed_back;
+    uint32_t magic;
+} perf_cfg_v1_t;
 
 typedef struct {
     int chan_id;
@@ -84,6 +92,7 @@ typedef enum {
 
 typedef enum {
     MENU_SPEED_FWD = 0,
+    MENU_SPEED_FWD_FAST,
     MENU_DIST_FWD,
     MENU_SPEED_BACK,
     MENU_ABOUT,
@@ -120,7 +129,9 @@ static volatile uint32_t s_motor_last_steps_done;
 typedef struct {
     float distance_mm;
     float target_speed_mm_s;
+    float fast_speed_mm_s;
     bool forward;
+    bool allow_fast_boost;
     bool with_progress;
 } motor_move_cmd_t;
 
@@ -295,6 +306,7 @@ static const char *menu_name(menu_item_t item)
 {
     static const char *names[MENU_COUNT] = {
         "Velocidad avance",
+        "Velocidad avance rapido",
         "Recorrido total",
         "Velocidad retroceso",
         "Acerca de",
@@ -318,6 +330,9 @@ static void draw_config_screen(void)
     switch (s_menu_idx) {
     case MENU_SPEED_FWD:
         snprintf(v, sizeof(v), "%.2f mm/s", s_cfg_edit.speed_fwd);
+        break;
+    case MENU_SPEED_FWD_FAST:
+        snprintf(v, sizeof(v), "%.2f mm/s", s_cfg_edit.speed_fwd_fast);
         break;
     case MENU_DIST_FWD:
         snprintf(v, sizeof(v), "%.1f mm", s_cfg_edit.dist_fwd);
@@ -376,6 +391,7 @@ static float clampf(float v, float lo, float hi)
 static void cfg_set_defaults(perf_cfg_t *cfg)
 {
     cfg->speed_fwd = 0.60f;
+    cfg->speed_fwd_fast = 1.20f;
     cfg->dist_fwd = 112.0f;
     cfg->speed_back = 10.0f;
     cfg->magic = MAGIC_CFG;
@@ -395,18 +411,40 @@ static esp_err_t cfg_save(const perf_cfg_t *cfg)
 
 static void cfg_load(perf_cfg_t *cfg)
 {
-    size_t sz = sizeof(*cfg);
+    size_t sz = 0;
     nvs_handle_t h;
     if (nvs_open("perfusor", NVS_READONLY, &h) != ESP_OK) {
         cfg_set_defaults(cfg);
         return;
     }
-    if (nvs_get_blob(h, "cfg", cfg, &sz) != ESP_OK || sz != sizeof(*cfg) || cfg->magic != MAGIC_CFG) {
+
+    bool loaded = false;
+    if (nvs_get_blob(h, "cfg", NULL, &sz) == ESP_OK) {
+        if (sz == sizeof(*cfg)) {
+            perf_cfg_t tmp;
+            if (nvs_get_blob(h, "cfg", &tmp, &sz) == ESP_OK && tmp.magic == MAGIC_CFG) {
+                *cfg = tmp;
+                loaded = true;
+            }
+        } else if (sz == sizeof(perf_cfg_v1_t)) {
+            perf_cfg_v1_t old_cfg;
+            if (nvs_get_blob(h, "cfg", &old_cfg, &sz) == ESP_OK && old_cfg.magic == MAGIC_CFG) {
+                cfg_set_defaults(cfg);
+                cfg->speed_fwd = old_cfg.speed_fwd;
+                cfg->dist_fwd = old_cfg.dist_fwd;
+                cfg->speed_back = old_cfg.speed_back;
+                loaded = true;
+            }
+        }
+    }
+
+    if (!loaded) {
         cfg_set_defaults(cfg);
     }
     nvs_close(h);
 
     cfg->speed_fwd = clampf(cfg->speed_fwd, MIN_SPEED_MM_S, MAX_SPEED_MM_S);
+    cfg->speed_fwd_fast = clampf(cfg->speed_fwd_fast, MIN_SPEED_MM_S, MAX_SPEED_MM_S);
     cfg->speed_back = clampf(cfg->speed_back, MIN_SPEED_MM_S, MAX_SPEED_MM_S);
     cfg->dist_fwd = clampf(cfg->dist_fwd, 0.0f, MAX_DISTANCE_MM);
     cfg->magic = MAGIC_CFG;
@@ -693,7 +731,7 @@ static bool motor_timer_set_period(uint32_t period_us)
     return gptimer_set_alarm_action(s_step_timer, &alarm_cfg) == ESP_OK;
 }
 
-static bool motor_execute_move(float distance_mm, float target_speed_mm_s, bool forward, bool with_progress)
+static bool motor_execute_move(float distance_mm, float target_speed_mm_s, float fast_speed_mm_s, bool forward, bool allow_fast_boost, bool with_progress)
 {
     uint32_t steps = (uint32_t)(distance_mm * STEPS_PER_MM + 0.5f);
     s_motor_last_steps_done = 0;
@@ -710,11 +748,27 @@ static bool motor_execute_move(float distance_mm, float target_speed_mm_s, bool 
     }
 
     float target = clampf(target_speed_mm_s, MIN_SPEED_MM_S, MAX_SPEED_MM_S);
+    float fast_target = clampf(fast_speed_mm_s, MIN_SPEED_MM_S, MAX_SPEED_MM_S);
+    if (fast_target < target) {
+        fast_target = target;
+    }
     float total_mm = (float)steps / STEPS_PER_MM;
     uint32_t done_steps = 0;
     int last_drawn_pct = -1;
     uint32_t last_period_us = 0;
     bool cancelled = false;
+    bool fast_mode_active = false;
+    bool adv_prev_raw = false;
+    int64_t adv_press_start_ms = 0;
+    bool adv_toggle_consumed = false;
+    int64_t last_boost_poll_ms = 0;
+
+    if (allow_fast_boost && forward) {
+        adv_prev_raw = touch_button_pressed_raw(&s_btn_adv);
+        if (adv_prev_raw) {
+            adv_press_start_ms = now_ms();
+        }
+    }
 
     gpio_set_level(PIN_DIR, forward ? 1 : 0);
     motor_set_enable(true);
@@ -734,11 +788,35 @@ static bool motor_execute_move(float distance_mm, float target_speed_mm_s, bool 
         }
 
         done_steps = s_step_done_pulses;
+
+        if (allow_fast_boost && forward) {
+            int64_t now = now_ms();
+            if ((now - last_boost_poll_ms) >= 20) {
+                bool adv_now_raw = touch_button_pressed_raw(&s_btn_adv);
+                if (adv_now_raw && !adv_prev_raw) {
+                    adv_press_start_ms = now;
+                    adv_toggle_consumed = false;
+                } else if (!adv_now_raw) {
+                    adv_press_start_ms = 0;
+                    adv_toggle_consumed = false;
+                }
+
+                if (adv_now_raw && !adv_toggle_consumed && adv_press_start_ms != 0 && (now - adv_press_start_ms) >= 100) {
+                    fast_mode_active = !fast_mode_active;
+                    adv_toggle_consumed = true;
+                }
+
+                adv_prev_raw = adv_now_raw;
+                last_boost_poll_ms = now;
+            }
+        }
+
+        float target_now = fast_mode_active ? fast_target : target;
         float x_mm = (float)done_steps / STEPS_PER_MM;
         float remain_mm = total_mm - x_mm;
         float v_acc = sqrtf(2.0f * ACCEL_MM_S2 * fmaxf(x_mm, 0.0f));
         float v_dec = sqrtf(2.0f * ACCEL_MM_S2 * fmaxf(remain_mm, 0.0f));
-        float cur = fminf(target, fminf(v_acc, v_dec));
+        float cur = fminf(target_now, fminf(v_acc, v_dec));
         if (cur < MIN_SPEED_MM_S) {
             cur = MIN_SPEED_MM_S;
         }
@@ -804,7 +882,12 @@ static void motor_worker_task(void *arg)
     while (1) {
         motor_move_cmd_t cmd;
         if (xQueueReceive(s_motor_cmd_queue, &cmd, portMAX_DELAY) == pdTRUE) {
-            s_motor_last_cancelled = motor_execute_move(cmd.distance_mm, cmd.target_speed_mm_s, cmd.forward, cmd.with_progress);
+            s_motor_last_cancelled = motor_execute_move(cmd.distance_mm,
+                                                        cmd.target_speed_mm_s,
+                                                        cmd.fast_speed_mm_s,
+                                                        cmd.forward,
+                                                        cmd.allow_fast_boost,
+                                                        cmd.with_progress);
             if (s_motor_waiter_task != NULL) {
                 xTaskNotifyGive(s_motor_waiter_task);
             }
@@ -812,16 +895,18 @@ static void motor_worker_task(void *arg)
     }
 }
 
-static bool motor_move_mm(float distance_mm, float target_speed_mm_s, bool forward, bool with_progress)
+static bool motor_move_mm(float distance_mm, float target_speed_mm_s, float fast_speed_mm_s, bool forward, bool allow_fast_boost, bool with_progress)
 {
     if (s_motor_cmd_queue == NULL) {
-        return motor_execute_move(distance_mm, target_speed_mm_s, forward, with_progress);
+        return motor_execute_move(distance_mm, target_speed_mm_s, fast_speed_mm_s, forward, allow_fast_boost, with_progress);
     }
 
     motor_move_cmd_t cmd = {
         .distance_mm = distance_mm,
         .target_speed_mm_s = target_speed_mm_s,
+        .fast_speed_mm_s = fast_speed_mm_s,
         .forward = forward,
+        .allow_fast_boost = allow_fast_boost,
         .with_progress = with_progress,
     };
 
@@ -836,7 +921,7 @@ static bool motor_move_mm(float distance_mm, float target_speed_mm_s, bool forwa
     return s_motor_last_cancelled;
 }
 
-static bool perform_positioned_move(float distance_mm, float speed_mm_s, bool forward)
+static bool perform_positioned_move(float distance_mm, float speed_mm_s, bool forward, bool allow_fast_boost)
 {
     if (distance_mm <= 0.0f) {
         return false;
@@ -847,7 +932,8 @@ static bool perform_positioned_move(float distance_mm, float speed_mm_s, bool fo
 
     s_motor_busy = true;
     s_motor_stop_requested = false;
-    bool cancelled = motor_move_mm(distance_mm, speed_mm_s, forward, true);
+    float fast_speed = allow_fast_boost ? s_cfg.speed_fwd_fast : speed_mm_s;
+    bool cancelled = motor_move_mm(distance_mm, speed_mm_s, fast_speed, forward, allow_fast_boost, true);
     apply_steps_to_position(s_motor_last_steps_done, forward);
 
     if (forward && !cancelled) {
@@ -978,6 +1064,9 @@ static void set_edit_buffer_from_menu(void)
     case MENU_SPEED_FWD:
         snprintf(s_edit_buf, sizeof(s_edit_buf), "%05.2f", s_cfg_edit.speed_fwd);
         break;
+    case MENU_SPEED_FWD_FAST:
+        snprintf(s_edit_buf, sizeof(s_edit_buf), "%05.2f", s_cfg_edit.speed_fwd_fast);
+        break;
     case MENU_DIST_FWD:
         snprintf(s_edit_buf, sizeof(s_edit_buf), "%05.1f", s_cfg_edit.dist_fwd);
         break;
@@ -1000,6 +1089,9 @@ static void apply_edit_buffer_to_cfg(void)
     switch (s_menu_idx) {
     case MENU_SPEED_FWD:
         s_cfg_edit.speed_fwd = clampf(v, MIN_SPEED_MM_S, MAX_SPEED_MM_S);
+        break;
+    case MENU_SPEED_FWD_FAST:
+        s_cfg_edit.speed_fwd_fast = clampf(v, MIN_SPEED_MM_S, MAX_SPEED_MM_S);
         break;
     case MENU_DIST_FWD:
         s_cfg_edit.dist_fwd = clampf(v, 0.0f, MAX_DISTANCE_MM);
@@ -1074,7 +1166,7 @@ static void app_loop(void)
 
             if (s_btn_adv.just_released) {
                 if (s_btn_adv.last_hold_ms >= 30 && !s_btn_back.pressed) {
-                    perform_positioned_move(fmaxf(0.0f, s_cfg.dist_fwd - s_position_mm), s_cfg.speed_fwd, true);
+                    perform_positioned_move(fmaxf(0.0f, s_cfg.dist_fwd - s_position_mm), s_cfg.speed_fwd, true, true);
                     draw_main_touch_feedback(s_btn_adv.pressed, s_btn_run.pressed, s_btn_back.pressed);
                 }
             }
@@ -1092,7 +1184,7 @@ static void app_loop(void)
                     skip_back_release_action = false;
                 } else {
                     if (s_btn_back.last_hold_ms >= 30 && !s_btn_adv.pressed) {
-                        perform_positioned_move(fmaxf(0.0f, s_position_mm), s_cfg.speed_back, false);
+                        perform_positioned_move(fmaxf(0.0f, s_position_mm), s_cfg.speed_back, false, false);
                         draw_main_touch_feedback(s_btn_adv.pressed, s_btn_run.pressed, s_btn_back.pressed);
                     }
                 }

@@ -45,6 +45,7 @@ Estos GPIO son aptos para salida en ESP32 clasico.
 ### Acciones en pantalla principal
 
 - ADEL pulsacion >100 ms: avanza hasta el final del recorrido configurado a la velocidad de avance.
+- Durante ese avance, si se mantiene ADEL al menos 100 ms, se activa el modo de avance rapido y la marcha pasa a la velocidad de avance rapido configurada. Si de nuevo pulsamos, volvemos a la velocidad normal.
 - ATRAS pulsacion >100 ms: retrocede hasta la posicion 0 a la velocidad de retroceso.
 - PARO durante movimiento: detiene el avance o retroceso de forma inmediata, conservando la posicion alcanzada.
 - PARO pulsacion >=4 s: entra a configuracion.
@@ -52,6 +53,7 @@ Estos GPIO son aptos para salida en ESP32 clasico.
 ### Configuracion disponible
 
 - Velocidad avance (mm/s)
+- Velocidad avance rapido (mm/s)
 - Recorrido total (mm)
 - Velocidad retroceso (mm/s)
 - Acerca de
@@ -77,6 +79,7 @@ Estos GPIO son aptos para salida en ESP32 clasico.
 
 - Recorrido total: 112.0 mm
 - Velocidad avance: 0.60 mm/s
+- Velocidad avance rapido: 1.20 mm/s
 - Velocidad retroceso: 10.00 mm/s
 
 ## Estructura del proyecto
